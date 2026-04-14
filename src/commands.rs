@@ -21,7 +21,7 @@ use zellij_utils::sessions::{
     validate_session_name, ActiveSession, SessionNameMatch,
 };
 
-use zellij_utils::consts::session_layout_cache_file_name;
+use zellij_utils::consts::{session_info_cache_file_name, session_layout_cache_file_name};
 
 #[cfg(feature = "web_server_capability")]
 use zellij_client::web_client::start_web_client as start_web_client_impl;
@@ -38,7 +38,7 @@ use miette::{Report, Result};
 use zellij_server::{os_input_output::get_server_os_input, start_server as start_server_impl};
 use zellij_utils::{
     cli::{CliArgs, Command, SessionCommand, Sessions},
-    data::ConnectToSession,
+    data::{ConnectToSession, SessionInfo},
     envs,
     input::{
         actions::Action,
@@ -49,6 +49,57 @@ use zellij_utils::{
 };
 
 pub(crate) use zellij_utils::sessions::list_sessions;
+
+fn resolve_current_cli_session_name(
+    env_session_name: Option<String>,
+    env_pane_id: Option<u32>,
+    live_session_infos: Vec<(String, SessionInfo)>,
+) -> Option<String> {
+    if let Some(env_session_name) = env_session_name {
+        if live_session_infos
+            .iter()
+            .any(|(session_name, _)| session_name == &env_session_name)
+        {
+            return Some(env_session_name);
+        }
+    }
+    let env_pane_id = env_pane_id?;
+    let mut matching_sessions = live_session_infos
+        .into_iter()
+        .filter_map(|(session_name, session_info)| {
+            let has_matching_terminal_pane = session_info
+                .panes
+                .panes
+                .values()
+                .flatten()
+                .any(|pane| !pane.is_plugin && pane.id == env_pane_id);
+            has_matching_terminal_pane.then_some(session_name)
+        })
+        .collect::<Vec<_>>();
+    if matching_sessions.len() == 1 {
+        matching_sessions.pop()
+    } else {
+        None
+    }
+}
+
+fn current_cli_session_name() -> Option<String> {
+    let env_session_name = envs::get_session_name().ok();
+    let env_pane_id = std::env::var("ZELLIJ_PANE_ID")
+        .ok()
+        .and_then(|pane_id| pane_id.parse::<u32>().ok());
+    let live_session_infos = get_sessions()
+        .ok()?
+        .into_iter()
+        .filter_map(|(session_name, _)| {
+            let raw_session_info =
+                std::fs::read_to_string(session_info_cache_file_name(&session_name)).ok()?;
+            let session_info = SessionInfo::from_string(&raw_session_info, "").ok()?;
+            Some((session_name, session_info))
+        })
+        .collect();
+    resolve_current_cli_session_name(env_session_name, env_pane_id, live_session_infos)
+}
 
 pub(crate) fn kill_all_sessions(yes: bool) {
     match get_sessions() {
@@ -432,7 +483,7 @@ pub(crate) fn send_action_to_session(
                     list_sessions(false, false, true);
                     std::process::exit(1);
                 }
-            } else if let Ok(session_name) = envs::get_session_name() {
+            } else if let Some(session_name) = current_cli_session_name() {
                 attach_with_cli_client(cli_action, &session_name, config);
             } else {
                 eprintln!("Please specify the session name to send actions to. The following sessions are active:");
@@ -482,7 +533,7 @@ pub(crate) fn subscribe_to_session(
                     list_sessions(false, false, true);
                     std::process::exit(1);
                 }
-            } else if let Ok(session_name) = envs::get_session_name() {
+            } else if let Some(session_name) = current_cli_session_name() {
                 session_name
             } else {
                 eprintln!("Please specify the session name to subscribe to. The following sessions are active:");
@@ -585,6 +636,67 @@ fn attach_with_cli_client(
             log::error!("Error sending action: {}", e);
             std::process::exit(2);
         },
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::resolve_current_cli_session_name;
+    use std::collections::HashMap;
+    use zellij_utils::data::{PaneInfo, PaneManifest, SessionInfo};
+
+    fn session_info_with_terminal_pane(pane_id: u32) -> SessionInfo {
+        let mut session_info = SessionInfo::new("test".to_owned());
+        session_info.update_pane_info(PaneManifest {
+            panes: HashMap::from([(
+                0,
+                vec![PaneInfo {
+                    id: pane_id,
+                    is_plugin: false,
+                    ..PaneInfo::default()
+                }],
+            )]),
+        });
+        session_info
+    }
+
+    #[test]
+    fn resolve_current_cli_session_name_prefers_existing_env_session_name() {
+        let session_name = resolve_current_cli_session_name(
+            Some("renamed-session".to_owned()),
+            Some(1),
+            vec![
+                ("renamed-session".to_owned(), session_info_with_terminal_pane(2)),
+                ("other-session".to_owned(), session_info_with_terminal_pane(1)),
+            ],
+        );
+        assert_eq!(session_name, Some("renamed-session".to_owned()));
+    }
+
+    #[test]
+    fn resolve_current_cli_session_name_falls_back_to_matching_pane_id() {
+        let session_name = resolve_current_cli_session_name(
+            Some("stale-session".to_owned()),
+            Some(7),
+            vec![
+                ("renamed-session".to_owned(), session_info_with_terminal_pane(7)),
+                ("other-session".to_owned(), session_info_with_terminal_pane(2)),
+            ],
+        );
+        assert_eq!(session_name, Some("renamed-session".to_owned()));
+    }
+
+    #[test]
+    fn resolve_current_cli_session_name_returns_none_for_ambiguous_pane_id() {
+        let session_name = resolve_current_cli_session_name(
+            Some("stale-session".to_owned()),
+            Some(7),
+            vec![
+                ("renamed-session".to_owned(), session_info_with_terminal_pane(7)),
+                ("other-session".to_owned(), session_info_with_terminal_pane(7)),
+            ],
+        );
+        assert_eq!(session_name, None);
     }
 }
 
